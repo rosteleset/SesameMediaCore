@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = [
+    "sesame_cmaf_cbcs",
+    "sesame_encrypted_cmaf_wire",
+    "sesame_media_timing",
+    "sesame_sframe_wire",
+]
+
+[workspace.package]
+edition = "2021"
+license = "GPL-3.0-only"
+repository = "https://gitap.ru/SesameWare/SesameMediaCore"
