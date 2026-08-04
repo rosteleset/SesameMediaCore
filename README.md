@@ -13,7 +13,7 @@ The workspace contains:
 
 SesameAgent and SesameDVR include this repository as a Git submodule and pin an
 exact commit. They use local Cargo path dependencies, so builds do not need
-Gitap credentials inside Cargo or Docker containers.
+remote repository credentials inside Cargo or Docker containers.
 
 Clone a consumer with its pinned MediaCore revision:
 
