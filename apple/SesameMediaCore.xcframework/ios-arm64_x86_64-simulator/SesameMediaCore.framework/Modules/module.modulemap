@@ -1,0 +1,4 @@
+framework module SesameMediaCore {
+    umbrella header "SesameMediaCore.h"
+    export *
+}

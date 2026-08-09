@@ -16,6 +16,14 @@ use rand::{rngs::OsRng, RngCore};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
+mod decrypt;
+mod ffi;
+
+pub use decrypt::{
+    clear_cbcs_cmaf_fragment, clear_cbcs_cmaf_initialization, normalize_clear_cmaf_initialization,
+    CbcsContentKey, CbcsDecryptionContext, ClearCmafInitialization, CmafFragmentTimeline,
+};
+
 #[derive(Clone)]
 pub struct SegmentEncryptionContext {
     pub kid: [u8; 16],
@@ -2549,6 +2557,62 @@ mod tests {
     #[test]
     fn packages_clear_fragment_and_round_trips_without_external_fixture() {
         assert_packaging_round_trip(synthetic_clear_avc_fragment(), false);
+    }
+
+    #[test]
+    fn common_decrypt_api_restores_packaged_fragment() {
+        assert_common_decrypt_round_trip(&synthetic_clear_avc_fragment());
+    }
+
+    #[test]
+    fn common_decrypt_api_restores_ffmpeg_fixture_when_path_is_provided() {
+        let Ok(path) = std::env::var("SESAME_DVR_CLEAR_CMAF_TEST_FIXTURE") else {
+            return;
+        };
+        let clear = std::fs::read(path).unwrap();
+        assert_common_decrypt_round_trip(&clear);
+    }
+
+    fn assert_common_decrypt_round_trip(clear: &[u8]) {
+        let fragment_start = parse_children(clear, 0, clear.len())
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.kind == *b"moov")
+            .map(|entry| entry.end())
+            .unwrap();
+        let kid = [0x42; 16];
+        let cek = [
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff,
+        ];
+        let packaging = SegmentEncryptionContext {
+            kid,
+            cek: zeroize::Zeroizing::new(cek),
+            crypt_blocks: 1,
+            skip_blocks: 9,
+        };
+        let protected = package_clear_cmaf_fragment_to_cbcs(
+            &clear[..fragment_start],
+            &clear[fragment_start..],
+            &packaging,
+        )
+        .unwrap();
+
+        let initialization = clear_cbcs_cmaf_initialization(&protected.init).unwrap();
+        assert_eq!(initialization.context.key_ids(), vec![kid]);
+        assert_eq!(
+            initialization.data,
+            normalize_clear_cmaf_initialization(&clear[..fragment_start]).unwrap()
+        );
+
+        let fragment = clear_cbcs_cmaf_fragment(
+            &protected.fragment,
+            &initialization.context,
+            &[CbcsContentKey::new(kid, cek)],
+            None,
+        )
+        .unwrap();
+        assert_eq!(fragment, clear[fragment_start..]);
     }
 
     #[test]
