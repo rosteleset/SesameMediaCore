@@ -4,6 +4,8 @@ pub const FRAME_MAGIC: &[u8; 8] = b"SESCMAF1";
 pub const FRAME_VERSION: u8 = 1;
 pub const FRAME_HEADER_BYTES: usize = 80;
 pub const DEFAULT_MAX_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
+pub const FRAME_FLAG_CBCS: u16 = 0x0001;
+pub const FRAME_MEDIA_FLAGS_MASK: u16 = FRAME_FLAG_CBCS;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -44,6 +46,11 @@ pub struct Frame {
 }
 
 impl Frame {
+    pub fn with_flags(mut self, flags: u16) -> Self {
+        self.flags = flags;
+        self
+    }
+
     pub fn segment(sequence: u64, start_unix_ms: i64, duration_ms: u32, payload: Vec<u8>) -> Self {
         Self {
             kind: FrameKind::Segment,
@@ -270,9 +277,9 @@ mod tests {
     #[test]
     fn part_and_completion_round_trip_with_identity_fields() {
         let frames = [
-            Frame::init(9, 123_000, vec![1, 2]),
-            Frame::part(9, 123_000, 500, 3, vec![3, 4]),
-            Frame::segment_complete(9, 123_000, 4_000),
+            Frame::init(9, 123_000, vec![1, 2]).with_flags(FRAME_FLAG_CBCS),
+            Frame::part(9, 123_000, 500, 3, vec![3, 4]).with_flags(FRAME_FLAG_CBCS),
+            Frame::segment_complete(9, 123_000, 4_000).with_flags(FRAME_FLAG_CBCS),
             Frame::ack_part(9, 3),
             Frame::nack_part(9, 3, "retry"),
         ];

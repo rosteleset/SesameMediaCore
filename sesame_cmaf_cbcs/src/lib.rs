@@ -145,6 +145,14 @@ pub struct ProtectedCmafInfo {
     pub fragment_count: u32,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClearCmafInfo {
+    pub file_len: u64,
+    pub moov_end: u64,
+    pub init_signature: String,
+    pub fragment_count: u32,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProtectedVideoCodec {
     H264,
@@ -176,6 +184,22 @@ pub struct ProtectedVideoFragment {
     pub nal_length_size: u8,
     pub parameter_sets: Vec<Vec<u8>>,
     pub samples: Vec<ProtectedVideoSample>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClearVideoSample {
+    pub pts_90khz: u64,
+    pub duration_90khz: u32,
+    pub keyframe: bool,
+    pub data: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClearVideoFragment {
+    pub codec: ProtectedVideoCodec,
+    pub nal_length_size: u8,
+    pub parameter_sets: Vec<Vec<u8>>,
+    pub samples: Vec<ClearVideoSample>,
 }
 
 pub fn encode_protected_video_sample_envelope(
@@ -457,6 +481,118 @@ pub fn inspect_protected_cmaf(bytes: &[u8]) -> Result<ProtectedCmafInfo, String>
     })
 }
 
+pub fn inspect_clear_cmaf(bytes: &[u8]) -> Result<ClearCmafInfo, String> {
+    let top = parse_children(bytes, 0, bytes.len())?;
+    let moov = top
+        .iter()
+        .copied()
+        .find(|entry| entry.kind == *b"moov")
+        .ok_or_else(|| "cmaf_missing_moov".to_string())?;
+    if moov.end() >= bytes.len() {
+        return Err("cmaf_missing_fragment".to_string());
+    }
+    if !scan_box_signatures(bytes, 0, bytes.len(), *b"senc").is_empty()
+        || !scan_box_signatures(bytes, 0, bytes.len(), *b"tenc").is_empty()
+    {
+        return Err("cmaf_unexpected_encryption".to_string());
+    }
+    let fragment_count = u32::try_from(top.iter().filter(|entry| entry.kind == *b"moof").count())
+        .map_err(|_| "cmaf_fragment_count_overflow".to_string())?;
+    if fragment_count == 0 {
+        return Err("cmaf_missing_fragment".to_string());
+    }
+    Ok(ClearCmafInfo {
+        file_len: bytes.len() as u64,
+        moov_end: moov.end() as u64,
+        init_signature: sha256_hex(&bytes[..moov.end()]),
+        fragment_count,
+    })
+}
+
+pub fn extract_clear_video_fragment(bytes: &[u8]) -> Result<ClearVideoFragment, String> {
+    inspect_clear_cmaf(bytes)?;
+    let top = parse_children(bytes, 0, bytes.len())?;
+    let moov = top
+        .iter()
+        .copied()
+        .find(|entry| entry.kind == *b"moov")
+        .ok_or_else(|| "cmaf_missing_moov".to_string())?;
+    let track = parse_clear_video_track(bytes, moov)?;
+    let mut samples = Vec::new();
+
+    for moof in top.iter().copied().filter(|entry| entry.kind == *b"moof") {
+        for traf in parse_children(bytes, moof.payload_start(), moof.end())?
+            .into_iter()
+            .filter(|entry| entry.kind == *b"traf")
+        {
+            let children = parse_children(bytes, traf.payload_start(), traf.end())?;
+            let tfhd = children
+                .iter()
+                .copied()
+                .find(|entry| entry.kind == *b"tfhd")
+                .ok_or_else(|| "cmaf_missing_tfhd".to_string())?;
+            let tfhd = parse_tfhd(bytes, tfhd)?;
+            if tfhd.track_id != track.track_id {
+                continue;
+            }
+            if !tfhd.default_base_is_moof || tfhd.has_base_data_offset {
+                return Err(format!("cmaf_unsupported_fragment_base:{}", tfhd.track_id));
+            }
+            let tfdt = children
+                .iter()
+                .copied()
+                .find(|entry| entry.kind == *b"tfdt")
+                .ok_or_else(|| format!("cmaf_missing_tfdt:{}", tfhd.track_id))?;
+            let mut decode_time = parse_tfdt(bytes, tfdt)?;
+            let runs = children
+                .iter()
+                .copied()
+                .filter(|entry| entry.kind == *b"trun")
+                .map(|entry| parse_video_trun(bytes, moof.start, entry, &tfhd))
+                .collect::<Result<Vec<_>, _>>()?;
+
+            for run in runs.iter().flat_map(|run| run.iter()) {
+                let end = run
+                    .data_offset
+                    .checked_add(run.data_size)
+                    .ok_or_else(|| "cmaf_sample_range_overflow".to_string())?;
+                let data = bytes
+                    .get(run.data_offset..end)
+                    .ok_or_else(|| "cmaf_sample_out_of_bounds".to_string())?
+                    .to_vec();
+                let pts = i128::from(decode_time) + i128::from(run.composition_time_offset);
+                if pts < 0 {
+                    return Err("cmaf_negative_video_pts".to_string());
+                }
+                samples.push(ClearVideoSample {
+                    pts_90khz: scale_to_90khz(pts as u64, track.timescale)?,
+                    duration_90khz: u32::try_from(scale_to_90khz(
+                        u64::from(run.duration),
+                        track.timescale,
+                    )?)
+                    .map_err(|_| "cmaf_video_duration_overflow".to_string())?,
+                    keyframe: video_sample_is_keyframe(&data, track.codec, track.nal_length_size)?,
+                    data,
+                });
+                decode_time = decode_time
+                    .checked_add(u64::from(run.duration))
+                    .ok_or_else(|| "cmaf_video_decode_time_overflow".to_string())?;
+            }
+        }
+    }
+
+    if samples.is_empty() {
+        return Err("cmaf_missing_video_samples".to_string());
+    }
+    Ok(ClearVideoFragment {
+        codec: track.codec,
+        nal_length_size: u8::try_from(track.nal_length_size)
+            .map_err(|_| "cmaf_invalid_video_nal_length_size".to_string())?,
+        parameter_sets: track.parameter_sets,
+        samples,
+    })
+}
+
 pub fn extract_protected_video_fragment(bytes: &[u8]) -> Result<ProtectedVideoFragment, String> {
     let protected = inspect_protected_cmaf(bytes)?;
     let top = parse_children(bytes, 0, bytes.len())?;
@@ -496,7 +632,7 @@ pub fn extract_protected_video_fragment(bytes: &[u8]) -> Result<ProtectedVideoFr
                 .iter()
                 .copied()
                 .filter(|entry| entry.kind == *b"trun")
-                .map(|entry| parse_protected_trun(bytes, moof.start, entry, &tfhd))
+                .map(|entry| parse_video_trun(bytes, moof.start, entry, &tfhd))
                 .collect::<Result<Vec<_>, _>>()?;
             let flat_runs = runs.iter().flat_map(|run| run.iter()).collect::<Vec<_>>();
             if flat_runs.is_empty() {
@@ -533,11 +669,7 @@ pub fn extract_protected_video_fragment(bytes: &[u8]) -> Result<ProtectedVideoFr
                         track.timescale,
                     )?)
                     .map_err(|_| "cbcs_video_duration_overflow".to_string())?,
-                    keyframe: protected_sample_is_keyframe(
-                        &data,
-                        track.codec,
-                        track.nal_length_size,
-                    )?,
+                    keyframe: video_sample_is_keyframe(&data, track.codec, track.nal_length_size)?,
                     iv,
                     subsamples: subsamples
                         .into_iter()
@@ -592,6 +724,18 @@ struct ProtectedRunSample {
 }
 
 fn parse_protected_video_track(bytes: &[u8], moov: Mp4Box) -> Result<ProtectedVideoTrack, String> {
+    parse_video_track(bytes, moov, true)
+}
+
+fn parse_clear_video_track(bytes: &[u8], moov: Mp4Box) -> Result<ProtectedVideoTrack, String> {
+    parse_video_track(bytes, moov, false)
+}
+
+fn parse_video_track(
+    bytes: &[u8],
+    moov: Mp4Box,
+    protected: bool,
+) -> Result<ProtectedVideoTrack, String> {
     let mut video_tracks = Vec::new();
     for trak in parse_children(bytes, moov.payload_start(), moov.end())?
         .into_iter()
@@ -615,19 +759,36 @@ fn parse_protected_video_track(bytes: &[u8], moov: Mp4Box) -> Result<ProtectedVi
             .payload_start()
             .checked_add(8)
             .ok_or_else(|| format!("cbcs_invalid_stsd:{track_id}"))?;
-        let sample_entry = parse_children(bytes, entries_start, stsd.end())?
+        let sample_entries = parse_children(bytes, entries_start, stsd.end())?;
+        let sample_entry = sample_entries
             .into_iter()
-            .find(|entry| entry.kind == *b"encv")
-            .ok_or_else(|| format!("cbcs_missing_protected_video_sample_entry:{track_id}"))?;
-        let frma = scan_box_signatures(bytes, sample_entry.start, sample_entry.end(), *b"frma")
-            .into_iter()
-            .next()
-            .ok_or_else(|| format!("cbcs_missing_frma:{track_id}"))?;
-        let original_format: [u8; 4] = bytes
-            .get(frma.payload_start()..frma.payload_start() + 4)
-            .ok_or_else(|| format!("cbcs_invalid_frma:{track_id}"))?
-            .try_into()
-            .unwrap();
+            .find(|entry| {
+                if protected {
+                    entry.kind == *b"encv"
+                } else {
+                    matches!(&entry.kind, b"avc1" | b"avc3" | b"hvc1" | b"hev1")
+                }
+            })
+            .ok_or_else(|| {
+                if protected {
+                    format!("cbcs_missing_protected_video_sample_entry:{track_id}")
+                } else {
+                    format!("cmaf_missing_clear_video_sample_entry:{track_id}")
+                }
+            })?;
+        let original_format = if protected {
+            let frma = scan_box_signatures(bytes, sample_entry.start, sample_entry.end(), *b"frma")
+                .into_iter()
+                .next()
+                .ok_or_else(|| format!("cbcs_missing_frma:{track_id}"))?;
+            bytes
+                .get(frma.payload_start()..frma.payload_start() + 4)
+                .ok_or_else(|| format!("cbcs_invalid_frma:{track_id}"))?
+                .try_into()
+                .unwrap()
+        } else {
+            sample_entry.kind
+        };
         let (codec, nal_length_size, parameter_sets) = match &original_format {
             b"avc1" | b"avc3" => {
                 let avcc =
@@ -774,7 +935,7 @@ fn parse_tfdt(bytes: &[u8], entry: Mp4Box) -> Result<u64, String> {
     }
 }
 
-fn parse_protected_trun(
+fn parse_video_trun(
     bytes: &[u8],
     moof_start: usize,
     entry: Mp4Box,
@@ -871,7 +1032,7 @@ fn scale_to_90khz(value: u64, timescale: u32) -> Result<u64, String> {
     u64::try_from(scaled).map_err(|_| "cbcs_video_timestamp_overflow".to_string())
 }
 
-fn protected_sample_is_keyframe(
+fn video_sample_is_keyframe(
     sample: &[u8],
     codec: ProtectedVideoCodec,
     nal_length_size: usize,
@@ -2557,6 +2718,25 @@ mod tests {
     #[test]
     fn packages_clear_fragment_and_round_trips_without_external_fixture() {
         assert_packaging_round_trip(synthetic_clear_avc_fragment(), false);
+    }
+
+    #[test]
+    fn inspects_and_extracts_clear_video_without_encryption_metadata() {
+        let clear = synthetic_clear_avc_fragment();
+        let info = inspect_clear_cmaf(&clear).unwrap();
+        assert_eq!(info.file_len, clear.len() as u64);
+        assert_eq!(info.fragment_count, 1);
+        assert!(info.moov_end > 0 && info.moov_end < info.file_len);
+
+        let video = extract_clear_video_fragment(&clear).unwrap();
+        assert_eq!(video.codec, ProtectedVideoCodec::H264);
+        assert_eq!(video.nal_length_size, 4);
+        assert_eq!(video.parameter_sets.len(), 2);
+        assert_eq!(video.samples.len(), 1);
+        assert_eq!(video.samples[0].pts_90khz, 0);
+        assert_eq!(video.samples[0].duration_90khz, 3_000);
+        assert!(video.samples[0].keyframe);
+        assert!(!video.samples[0].data.is_empty());
     }
 
     #[test]
