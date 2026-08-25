@@ -33,7 +33,7 @@ pub struct SegmentEncryptionContext {
 }
 
 const BOX_HEADER_BYTES: usize = 8;
-const CENC_PER_SAMPLE_IV_BYTES: usize = 8;
+const CENC_PER_SAMPLE_IV_BYTES: usize = 16;
 const CENC_CONSTANT_IV_BYTES: usize = 16;
 const AES_BLOCK_BYTES: usize = 16;
 pub const PROTECTED_VIDEO_ENVELOPE_MAGIC: &[u8; 8] = b"SESCBCS1";
@@ -445,7 +445,11 @@ pub fn inspect_protected_cmaf(bytes: &[u8]) -> Result<ProtectedCmafInfo, String>
         let payload = bytes
             .get(tenc.payload_start()..tenc.end())
             .ok_or_else(|| "cbcs_invalid_tenc".to_string())?;
-        if payload.len() < 24 || payload[0] != 1 || payload[6] != 1 {
+        if payload.len() < 24
+            || payload[0] != 1
+            || payload[6] != 1
+            || !matches!(payload[7], 0 | 8 | 16)
+        {
             return Err("cbcs_invalid_tenc".to_string());
         }
         let entry_kid: [u8; 16] = payload[8..24].try_into().unwrap();
@@ -647,7 +651,7 @@ pub fn extract_protected_video_fragment(bytes: &[u8]) -> Result<ProtectedVideoFr
                 .iter()
                 .map(|sample| (sample.data_offset, sample.data_size))
                 .collect::<Vec<_>>();
-            let encryption = parse_senc(bytes, senc, &senc_runs, None)?;
+            let encryption = parse_senc(bytes, senc, &senc_runs, None, track.per_sample_iv_size)?;
 
             for (run, (iv, subsamples)) in flat_runs.into_iter().zip(encryption) {
                 let end = run
@@ -712,6 +716,7 @@ struct ProtectedVideoTrack {
     codec: ProtectedVideoCodec,
     timescale: u32,
     nal_length_size: usize,
+    per_sample_iv_size: usize,
     parameter_sets: Vec<Vec<u8>>,
 }
 
@@ -789,6 +794,23 @@ fn parse_video_track(
         } else {
             sample_entry.kind
         };
+        let per_sample_iv_size = if protected {
+            let tenc = scan_box_signatures(bytes, sample_entry.start, sample_entry.end(), *b"tenc")
+                .into_iter()
+                .next()
+                .ok_or_else(|| format!("cbcs_missing_tenc:{track_id}"))?;
+            let size = usize::from(
+                *bytes
+                    .get(tenc.payload_start() + 7)
+                    .ok_or_else(|| format!("cbcs_truncated_tenc:{track_id}"))?,
+            );
+            if !matches!(size, 8 | 16) {
+                return Err(format!("cbcs_unsupported_tenc_iv:{track_id}"));
+            }
+            size
+        } else {
+            0
+        };
         let (codec, nal_length_size, parameter_sets) = match &original_format {
             b"avc1" | b"avc3" => {
                 let avcc =
@@ -838,6 +860,7 @@ fn parse_video_track(
             codec,
             timescale,
             nal_length_size,
+            per_sample_iv_size,
             parameter_sets,
         });
     }
@@ -2348,6 +2371,7 @@ fn parse_senc(
     entry: Mp4Box,
     runs: &[(usize, usize)],
     constant_iv: Option<[u8; CENC_CONSTANT_IV_BYTES]>,
+    per_sample_iv_size: usize,
 ) -> Result<Vec<ParsedSencEntry>, String> {
     let payload = entry.payload_start();
     let flags = read_u24(bytes, payload + 1)?;
@@ -2362,13 +2386,16 @@ fn parse_senc(
         let iv = if let Some(iv) = constant_iv {
             iv
         } else {
+            if !matches!(per_sample_iv_size, 8 | 16) {
+                return Err("cbcs_unsupported_senc_iv_size".to_string());
+            }
             let mut iv = [0u8; CENC_CONSTANT_IV_BYTES];
-            iv[..CENC_PER_SAMPLE_IV_BYTES].copy_from_slice(
+            iv[..per_sample_iv_size].copy_from_slice(
                 bytes
-                    .get(cursor..cursor + CENC_PER_SAMPLE_IV_BYTES)
+                    .get(cursor..cursor + per_sample_iv_size)
                     .ok_or_else(|| "cbcs_truncated_senc_iv".to_string())?,
             );
-            cursor += CENC_PER_SAMPLE_IV_BYTES;
+            cursor += per_sample_iv_size;
             iv
         };
         let subsamples = if has_subsamples {
@@ -2713,6 +2740,60 @@ mod tests {
         assert_eq!(auxiliary.senc.len(), 16);
         assert_eq!(read_u32(&auxiliary.senc, 12).unwrap(), 2);
         assert_eq!(auxiliary.total_size(), auxiliary.senc.len());
+    }
+
+    #[test]
+    fn video_uses_firefox_compatible_16_byte_per_sample_iv() {
+        let context = SegmentEncryptionContext {
+            kid: [0x42; 16],
+            cek: zeroize::Zeroizing::new([0x24; 16]),
+            crypt_blocks: 1,
+            skip_blocks: 9,
+        };
+        let placeholder = Mp4Box {
+            start: 0,
+            size: 8,
+            header_size: 8,
+            kind: *b"avc1",
+        };
+        let track = TrackProtectionPlan {
+            track_id: 1,
+            kind: TrackKind::Video,
+            codec: TrackCodec::H264 {
+                avcc: Vec::new(),
+                nal_length_size: 4,
+            },
+            sample_entry: placeholder,
+            original_format: *b"avc1",
+            size_ancestors: Vec::new(),
+        };
+        let sinf = build_track_sinf(&track, &context, &[0; CENC_CONSTANT_IV_BYTES]).unwrap();
+        let tenc = scan_box_signatures(&sinf, 0, sinf.len(), *b"tenc")
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(
+            sinf[tenc.payload_start() + 7],
+            CENC_PER_SAMPLE_IV_BYTES as u8
+        );
+
+        let sample = EncryptedSample {
+            track_id: 1,
+            track_kind: TrackKind::Video,
+            data_offset: 0,
+            data_size: 32,
+            iv: [0x33; CENC_CONSTANT_IV_BYTES],
+            subsamples: vec![Subsample {
+                clear_bytes: 16,
+                cipher_bytes: 16,
+            }],
+        };
+        let auxiliary = build_auxiliary_parts(&[sample]).unwrap();
+        assert_eq!(auxiliary.senc.len(), 40);
+        assert_eq!(
+            &auxiliary.senc[16..16 + CENC_PER_SAMPLE_IV_BYTES],
+            &[0x33; CENC_PER_SAMPLE_IV_BYTES]
+        );
     }
 
     #[test]
@@ -3086,7 +3167,12 @@ mod tests {
                         None
                     }
                 };
-                let entries = parse_senc(bytes, senc, &flat_runs, constant_iv)?;
+                let per_sample_iv_size = if constant_iv.is_some() {
+                    0
+                } else {
+                    CENC_PER_SAMPLE_IV_BYTES
+                };
+                let entries = parse_senc(bytes, senc, &flat_runs, constant_iv, per_sample_iv_size)?;
                 for ((data_offset, data_size), (iv, subsamples)) in
                     flat_runs.into_iter().zip(entries)
                 {
